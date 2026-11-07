@@ -282,16 +282,11 @@ impl GpuCollector {
         let utilization: Vec<(AdapterLuid, f64)>;
         let usage: Vec<(AdapterLuid, u64)>;
         match self.pdh.as_ref() {
-            Some(pdh) => {
-                if pdh.collect() {
-                    utilization = pdh.utilization_by_adapter();
-                    usage = pdh.dedicated_usage_by_adapter();
-                } else {
-                    utilization = Vec::new();
-                    usage = Vec::new();
-                }
+            Some(pdh) if pdh.collect() => {
+                utilization = pdh.utilization_by_adapter();
+                usage = pdh.dedicated_usage_by_adapter();
             }
-            None => {
+            _ => {
                 utilization = Vec::new();
                 usage = Vec::new();
             }
