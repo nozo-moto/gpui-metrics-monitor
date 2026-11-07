@@ -10,6 +10,16 @@ const MUTED: u32 = 0x91a2b8;
 const ACCENT: u32 = 0x62d6bd;
 const BLUE: u32 = 0x7eb7ff;
 const GRAPH_SAMPLES: usize = 60;
+const NETWORK_GRAPH_MAX_MIB_S: f64 = 10.;
+const DISK_GRAPH_MAX_MIB_S: f64 = 100.;
+const GRAPH_HEIGHT: f32 = 42.;
+
+struct GraphLabels {
+    maximum: String,
+    current: String,
+    zero: String,
+    over_range: bool,
+}
 
 #[derive(Default)]
 struct MetricHistory {
@@ -18,6 +28,7 @@ struct MetricHistory {
     gpu: VecDeque<Option<f64>>,
     network: VecDeque<Option<f64>>,
     disk: VecDeque<Option<f64>>,
+    memory_total: Option<u64>,
 }
 
 impl MetricHistory {
@@ -43,7 +54,17 @@ impl Dashboard {
             system.cpu_percent.map(|value| value as f64),
         );
         let memory = match (system.memory_used_bytes, system.memory_total_bytes) {
-            (Some(used), Some(total)) if total > 0 => Some(percent(used, total)),
+            (Some(used), Some(total)) if total > 0 => {
+                if self
+                    .history
+                    .memory_total
+                    .is_some_and(|previous| previous != total)
+                {
+                    self.history.memory.clear();
+                }
+                self.history.memory_total = Some(total);
+                Some(used as f64)
+            }
             _ => None,
         };
         MetricHistory::push(&mut self.history.memory, memory);
@@ -85,30 +106,74 @@ impl Dashboard {
         title: &'static str,
         samples: &VecDeque<Option<f64>>,
         color: u32,
-        fixed_max: Option<f64>,
-        unit: &'static str,
+        fixed_max: f64,
+        labels: GraphLabels,
     ) -> Div {
-        let peak = fixed_max.unwrap_or_else(|| {
-            samples
-                .iter()
-                .filter_map(|sample| *sample)
-                .fold(0_f64, f64::max)
-                .max(1.)
-        });
-        let mut bars = div().flex().items_end().gap(px(1.)).h(px(34.)).w_full();
-        for sample in samples {
-            let height = sample.map(|value| (value / peak * 34.).clamp(1., 34.));
-            let bar = match height {
-                Some(height) => div()
-                    .flex_1()
-                    .h(px(height as f32))
-                    .rounded_sm()
-                    .bg(rgb(color)),
-                None => div().flex_1().h(px(1.)),
-            };
-            bars = bars.child(bar);
-        }
+        let samples = samples.iter().copied().collect::<Vec<_>>();
+        let over_range =
+            labels.over_range || samples.iter().flatten().any(|value| *value > fixed_max);
+        let current_color = if over_range { 0xff9b83 } else { MUTED };
+        let chart = canvas(
+            move |_, _, _| (),
+            move |bounds, _, window, _| {
+                let left = bounds.origin.x;
+                let top = bounds.origin.y;
+                let width = bounds.size.width;
+                let x_right = left + width;
+                let mut grid = PathBuilder::stroke(px(1.));
+                for fraction in [0., 0.5, 1.] {
+                    let y = top + px(GRAPH_HEIGHT * fraction);
+                    grid.move_to(point(left, y));
+                    grid.line_to(point(x_right, y));
+                }
+                for fraction in [0., 0.2, 0.4, 0.6, 0.8, 1.] {
+                    let x = left + width * fraction;
+                    grid.move_to(point(x, top));
+                    grid.line_to(point(x, top + px(GRAPH_HEIGHT)));
+                }
+                if let Ok(path) = grid.build() {
+                    window.paint_path(path, rgb(PANEL_EDGE));
+                }
 
+                let mut segment = PathBuilder::stroke(px(2.));
+                let mut segment_points = 0;
+                let count = samples.len();
+                for (index, sample) in samples.iter().enumerate() {
+                    let Some(value) = sample else {
+                        if segment_points > 1
+                            && let Ok(path) =
+                                std::mem::replace(&mut segment, PathBuilder::stroke(px(2.))).build()
+                        {
+                            window.paint_path(path, rgb(color));
+                        }
+                        segment_points = 0;
+                        continue;
+                    };
+                    let age = count.saturating_sub(index + 1) as f32;
+                    let x = x_right - width * (age / GRAPH_SAMPLES as f32);
+                    let normalized = (*value / fixed_max).clamp(0., 1.) as f32;
+                    let y = top + px(GRAPH_HEIGHT * (1. - normalized));
+                    if segment_points == 0 {
+                        segment.move_to(point(x, y));
+                    } else {
+                        segment.line_to(point(x, y));
+                    }
+                    segment_points += 1;
+                }
+                if segment_points > 1
+                    && let Ok(path) = segment.build()
+                {
+                    window.paint_path(path, rgb(color));
+                }
+            },
+        )
+        .h(px(GRAPH_HEIGHT))
+        .w_full();
+        let current_text = if over_range {
+            format!("{} - OVER RANGE IN 60s", labels.current)
+        } else {
+            labels.current
+        };
         div()
             .flex()
             .flex_col()
@@ -117,10 +182,25 @@ impl Dashboard {
                 div()
                     .flex()
                     .justify_between()
+                    .gap_2()
                     .child(div().text_xs().text_color(rgb(MUTED)).child(title))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(unit)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(current_color))
+                            .child(current_text),
+                    ),
             )
-            .child(bars)
+            .child(chart)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(labels.zero)
+                    .child(labels.maximum),
+            )
     }
 
     fn metric_card(
@@ -194,26 +274,47 @@ impl Dashboard {
 
         let graph = match title {
             "GPUS" => Some(self.history_graph(
-                "Average GPU utilization · 60 s",
+                "Average GPU utilization - 60 s",
                 &self.history.gpu,
                 ACCENT,
-                Some(100.),
-                "%",
+                100.,
+                GraphLabels {
+                    maximum: "100%".to_owned(),
+                    current: latest_percent(&self.history.gpu),
+                    zero: "0%".to_owned(),
+                    over_range: false,
+                },
             )),
-            "NETWORK" => Some(self.history_graph(
-                "Aggregate RX + TX · 60 s",
-                &self.history.network,
-                BLUE,
-                None,
-                "KiB/s",
-            )),
-            "DISKS" => Some(self.history_graph(
-                "Aggregate read + write · 60 s",
-                &self.history.disk,
-                ACCENT,
-                None,
-                "KiB/s",
-            )),
+            "NETWORK" => {
+                let current = latest_value(&self.history.network);
+                Some(self.history_graph(
+                    "Aggregate RX + TX - 60 s",
+                    &self.history.network,
+                    BLUE,
+                    NETWORK_GRAPH_MAX_MIB_S,
+                    GraphLabels {
+                        maximum: "10 MiB/s".to_owned(),
+                        current: format_rate_mib(current),
+                        zero: "0 MiB/s".to_owned(),
+                        over_range: current.is_some_and(|value| value > NETWORK_GRAPH_MAX_MIB_S),
+                    },
+                ))
+            }
+            "DISKS" => {
+                let current = latest_value(&self.history.disk);
+                Some(self.history_graph(
+                    "Aggregate read + write - 60 s",
+                    &self.history.disk,
+                    ACCENT,
+                    DISK_GRAPH_MAX_MIB_S,
+                    GraphLabels {
+                        maximum: "100 MiB/s".to_owned(),
+                        current: format_rate_mib(current),
+                        zero: "0 MiB/s".to_owned(),
+                        over_range: current.is_some_and(|value| value > DISK_GRAPH_MAX_MIB_S),
+                    },
+                ))
+            }
             _ => None,
         };
         if let Some(graph) = graph {
@@ -395,26 +496,52 @@ impl Render for Dashboard {
                         "Total processor utilization".to_owned(),
                         ACCENT,
                         self.history_graph(
-                            "History · 60 s",
+                            "History - 60 s",
                             &self.history.cpu,
                             ACCENT,
-                            Some(100.),
-                            "%",
+                            100.,
+                            GraphLabels {
+                                maximum: "100%".to_owned(),
+                                current: latest_percent(&self.history.cpu),
+                                zero: "0%".to_owned(),
+                                over_range: false,
+                            },
                         ),
                     ))
-                    .child(self.metric_card(
-                        "MEMORY",
-                        memory,
-                        memory_detail,
-                        BLUE,
-                        self.history_graph(
-                            "History · 60 s",
-                            &self.history.memory,
+                    .child(
+                        self.metric_card(
+                            "MEMORY",
+                            memory,
+                            memory_detail,
                             BLUE,
-                            Some(100.),
-                            "%",
+                            self.history_graph(
+                                "History - 60 s",
+                                &self.history.memory,
+                                BLUE,
+                                self.history.memory_total.unwrap_or(1) as f64,
+                                GraphLabels {
+                                    maximum: self
+                                        .history
+                                        .memory_total
+                                        .map(|total| format_bytes(Some(total)))
+                                        .unwrap_or_else(|| "Total unavailable".to_owned()),
+                                    current: match (
+                                        self.system.memory_used_bytes,
+                                        self.history.memory_total,
+                                    ) {
+                                        (Some(used), Some(total)) => format!(
+                                            "Used {} / {}",
+                                            format_bytes(Some(used)),
+                                            format_bytes(Some(total))
+                                        ),
+                                        _ => "Used unavailable".to_owned(),
+                                    },
+                                    zero: "0 B".to_owned(),
+                                    over_range: false,
+                                },
+                            ),
                         ),
-                    )),
+                    ),
             )
             .child(
                 div()
@@ -432,6 +559,21 @@ impl Render for Dashboard {
     }
 }
 
+fn latest_value(samples: &VecDeque<Option<f64>>) -> Option<f64> {
+    samples.back().copied().flatten()
+}
+
+fn latest_percent(samples: &VecDeque<Option<f64>>) -> String {
+    latest_value(samples)
+        .map(|value| format!("Current {value:.1}%"))
+        .unwrap_or_else(|| "Current unavailable".to_owned())
+}
+
+fn format_rate_mib(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("Current {value:.2} MiB/s"))
+        .unwrap_or_else(|| "Current unavailable".to_owned())
+}
 fn format_rate(value: Option<f64>) -> String {
     value
         .filter(|bytes_per_sec| bytes_per_sec.is_finite() && *bytes_per_sec >= 0.)
@@ -474,5 +616,5 @@ fn aggregate_throughput(values: impl Iterator<Item = (Option<f64>, Option<f64>)>
         total += first + second;
         found = true;
     }
-    (found && total.is_finite()).then_some(total / 1024.)
+    (found && total.is_finite()).then_some(total / (1024. * 1024.))
 }
