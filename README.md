@@ -10,7 +10,7 @@ Use a current stable Rust toolchain for Windows MSVC:
 cargo run
 ```
 
-The dashboard refreshes once per second. Its collector runs on a separate thread from the GPUI event loop. A reading is shown as unavailable when Windows does not supply a reliable value. Rate counters need two samples, so a few readings are unavailable during the first second.
+The dashboard refreshes once per second and keeps 60 seconds of in-memory history for CPU, memory, GPU utilization, aggregate network throughput, and aggregate disk throughput. Its collector runs on a separate thread from the GPUI event loop. A reading is shown as unavailable when Windows does not supply a reliable value. Rate counters need two samples, so a few readings are unavailable during the first second.
 
 ## Data sources
 
