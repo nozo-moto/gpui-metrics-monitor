@@ -1,5 +1,6 @@
 use crate::metrics::{DiskSnapshot, GpuSnapshot, NetworkSnapshot, SystemSnapshot};
 use gpui::*;
+use std::collections::VecDeque;
 
 const PAGE: u32 = 0x0b1220;
 const PANEL: u32 = 0x121d2e;
@@ -8,24 +9,132 @@ const TEXT: u32 = 0xe5edf7;
 const MUTED: u32 = 0x91a2b8;
 const ACCENT: u32 = 0x62d6bd;
 const BLUE: u32 = 0x7eb7ff;
+const GRAPH_SAMPLES: usize = 60;
+
+#[derive(Default)]
+struct MetricHistory {
+    cpu: VecDeque<Option<f64>>,
+    memory: VecDeque<Option<f64>>,
+    gpu: VecDeque<Option<f64>>,
+    network: VecDeque<Option<f64>>,
+    disk: VecDeque<Option<f64>>,
+}
+
+impl MetricHistory {
+    fn push(history: &mut VecDeque<Option<f64>>, value: Option<f64>) {
+        if history.len() == GRAPH_SAMPLES {
+            history.pop_front();
+        }
+        history.push_back(value.filter(|sample| sample.is_finite() && *sample >= 0.));
+    }
+}
 
 #[derive(Default)]
 pub struct Dashboard {
     system: SystemSnapshot,
     gpus: Vec<GpuSnapshot>,
+    history: MetricHistory,
 }
 
 impl Dashboard {
     pub fn update(&mut self, system: SystemSnapshot, gpus: Vec<GpuSnapshot>) {
+        MetricHistory::push(
+            &mut self.history.cpu,
+            system.cpu_percent.map(|value| value as f64),
+        );
+        let memory = match (system.memory_used_bytes, system.memory_total_bytes) {
+            (Some(used), Some(total)) if total > 0 => Some(percent(used, total)),
+            _ => None,
+        };
+        MetricHistory::push(&mut self.history.memory, memory);
+        let gpu_average = if gpus.is_empty() {
+            None
+        } else {
+            gpus.iter()
+                .try_fold((0_f64, 0_usize), |(sum, count), gpu| {
+                    let value = gpu.utilization_percent? as f64;
+                    (value.is_finite() && value >= 0.).then_some((sum + value, count + 1))
+                })
+                .map(|(sum, count)| sum / count as f64)
+        };
+        MetricHistory::push(&mut self.history.gpu, gpu_average);
+        MetricHistory::push(
+            &mut self.history.network,
+            aggregate_throughput(system.networks.iter().map(|network| {
+                (
+                    network.received_bytes_per_sec,
+                    network.transmitted_bytes_per_sec,
+                )
+            })),
+        );
+        MetricHistory::push(
+            &mut self.history.disk,
+            aggregate_throughput(
+                system
+                    .disks
+                    .iter()
+                    .map(|disk| (disk.read_bytes_per_sec, disk.written_bytes_per_sec)),
+            ),
+        );
         self.system = system;
         self.gpus = gpus;
     }
 
-    fn metric_card(&self, title: &'static str, value: String, detail: String, accent: u32) -> Div {
+    fn history_graph(
+        &self,
+        title: &'static str,
+        samples: &VecDeque<Option<f64>>,
+        color: u32,
+        fixed_max: Option<f64>,
+        unit: &'static str,
+    ) -> Div {
+        let peak = fixed_max.unwrap_or_else(|| {
+            samples
+                .iter()
+                .filter_map(|sample| *sample)
+                .fold(0_f64, f64::max)
+                .max(1.)
+        });
+        let mut bars = div().flex().items_end().gap(px(1.)).h(px(34.)).w_full();
+        for sample in samples {
+            let height = sample.map(|value| (value / peak * 34.).clamp(1., 34.));
+            let bar = match height {
+                Some(height) => div()
+                    .flex_1()
+                    .h(px(height as f32))
+                    .rounded_sm()
+                    .bg(rgb(color)),
+                None => div().flex_1().h(px(1.)),
+            };
+            bars = bars.child(bar);
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(title))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(unit)),
+            )
+            .child(bars)
+    }
+
+    fn metric_card(
+        &self,
+        title: &'static str,
+        value: String,
+        detail: String,
+        accent: u32,
+        graph: Div,
+    ) -> Div {
         div()
             .flex_1()
             .min_w(px(260.))
-            .h(px(164.))
+            .h(px(188.))
             .flex()
             .flex_col()
             .justify_between()
@@ -55,6 +164,7 @@ impl Dashboard {
                     )
                     .child(div().text_sm().text_color(rgb(MUTED)).child(detail)),
             )
+            .child(graph)
     }
 
     fn list_panel(
@@ -81,6 +191,34 @@ impl Dashboard {
                     .text_color(rgb(MUTED))
                     .child(title),
             );
+
+        let graph = match title {
+            "GPUS" => Some(self.history_graph(
+                "Average GPU utilization · 60 s",
+                &self.history.gpu,
+                ACCENT,
+                Some(100.),
+                "%",
+            )),
+            "NETWORK" => Some(self.history_graph(
+                "Aggregate RX + TX · 60 s",
+                &self.history.network,
+                BLUE,
+                None,
+                "KiB/s",
+            )),
+            "DISKS" => Some(self.history_graph(
+                "Aggregate read + write · 60 s",
+                &self.history.disk,
+                ACCENT,
+                None,
+                "KiB/s",
+            )),
+            _ => None,
+        };
+        if let Some(graph) = graph {
+            panel = panel.child(graph);
+        }
 
         if entries.is_empty() {
             panel = panel.child(div().text_sm().text_color(rgb(MUTED)).child(empty_label));
@@ -135,7 +273,8 @@ impl Dashboard {
             .map(|gpu| {
                 let utilization = gpu
                     .utilization_percent
-                    .map(|value| format!("Utilization {value:.1}%"))
+                    .filter(|value| value.is_finite() && *value >= 0.)
+                    .map(|value| format!("Utilization {:.1}%", value.min(100.)))
                     .unwrap_or_else(|| "Utilization unavailable".to_owned());
                 let memory = match (gpu.dedicated_used_bytes, gpu.dedicated_total_bytes) {
                     (Some(used), Some(total)) => format!(
@@ -189,20 +328,21 @@ impl Render for Dashboard {
         let cpu = self
             .system
             .cpu_percent
+            .filter(|value| value.is_finite() && *value >= 0.)
             .map(|value| format!("{value:.1}%"))
             .unwrap_or_else(|| "Unavailable".to_owned());
         let memory = match (
             self.system.memory_used_bytes,
             self.system.memory_total_bytes,
         ) {
-            (Some(used), Some(total)) => format!("{:.1}%", percent(used, total)),
+            (Some(used), Some(total)) if total > 0 => format!("{:.1}%", percent(used, total)),
             _ => "Unavailable".to_owned(),
         };
         let memory_detail = match (
             self.system.memory_used_bytes,
             self.system.memory_total_bytes,
         ) {
-            (Some(used), Some(total)) => {
+            (Some(used), Some(total)) if total > 0 => {
                 format!(
                     "{} / {}",
                     format_bytes(Some(used)),
@@ -254,8 +394,27 @@ impl Render for Dashboard {
                         cpu,
                         "Total processor utilization".to_owned(),
                         ACCENT,
+                        self.history_graph(
+                            "History · 60 s",
+                            &self.history.cpu,
+                            ACCENT,
+                            Some(100.),
+                            "%",
+                        ),
                     ))
-                    .child(self.metric_card("MEMORY", memory, memory_detail, BLUE)),
+                    .child(self.metric_card(
+                        "MEMORY",
+                        memory,
+                        memory_detail,
+                        BLUE,
+                        self.history_graph(
+                            "History · 60 s",
+                            &self.history.memory,
+                            BLUE,
+                            Some(100.),
+                            "%",
+                        ),
+                    )),
             )
             .child(
                 div()
@@ -275,7 +434,8 @@ impl Render for Dashboard {
 
 fn format_rate(value: Option<f64>) -> String {
     value
-        .map(|bytes_per_sec| format!("{}/s", format_bytes(Some(bytes_per_sec.max(0.) as u64))))
+        .filter(|bytes_per_sec| bytes_per_sec.is_finite() && *bytes_per_sec >= 0.)
+        .map(|bytes_per_sec| format!("{}/s", format_bytes(Some(bytes_per_sec as u64))))
         .unwrap_or_else(|| "Unavailable".to_owned())
 }
 
@@ -298,9 +458,21 @@ fn format_bytes(value: Option<u64>) -> String {
 }
 
 fn percent(used: u64, total: u64) -> f64 {
-    if total == 0 {
-        0.
-    } else {
-        (used as f64 / total as f64 * 100.).min(100.)
+    (used as f64 / total as f64 * 100.).min(100.)
+}
+
+fn aggregate_throughput(values: impl Iterator<Item = (Option<f64>, Option<f64>)>) -> Option<f64> {
+    let mut total = 0.;
+    let mut found = false;
+    for (first, second) in values {
+        let (Some(first), Some(second)) = (first, second) else {
+            return None;
+        };
+        if !first.is_finite() || !second.is_finite() || first < 0. || second < 0. {
+            return None;
+        }
+        total += first + second;
+        found = true;
     }
+    (found && total.is_finite()).then_some(total / 1024.)
 }
