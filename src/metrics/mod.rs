@@ -39,4 +39,3 @@ pub struct GpuSnapshot {
 
 pub mod gpu;
 pub mod system;
-

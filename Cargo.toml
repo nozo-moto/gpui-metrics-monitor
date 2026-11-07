@@ -7,3 +7,6 @@ edition = "2024"
 gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
 sysinfo = "0.40.1"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_Performance"] }
+

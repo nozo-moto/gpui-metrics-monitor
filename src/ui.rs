@@ -129,6 +129,27 @@ impl Dashboard {
             .collect()
     }
 
+    fn gpu_entries(&self) -> Vec<(String, String, String)> {
+        self.gpus
+            .iter()
+            .map(|gpu| {
+                let utilization = gpu
+                    .utilization_percent
+                    .map(|value| format!("Utilization {value:.1}%"))
+                    .unwrap_or_else(|| "Utilization unavailable".to_owned());
+                let memory = match (gpu.dedicated_used_bytes, gpu.dedicated_total_bytes) {
+                    (Some(used), Some(total)) => format!(
+                        "Dedicated VRAM {} / {}",
+                        format_bytes(Some(used)),
+                        format_bytes(Some(total))
+                    ),
+                    _ => "Dedicated VRAM unavailable".to_owned(),
+                };
+                (gpu.name.clone(), utilization, memory)
+            })
+            .collect()
+    }
+
     fn disk_entries(&self) -> Vec<(String, String, String)> {
         self.system
             .disks
@@ -190,28 +211,14 @@ impl Render for Dashboard {
             }
             _ => "Memory usage unavailable".to_owned(),
         };
-        let gpu = self.gpus.first();
-        let gpu_usage = gpu
-            .and_then(|gpu| gpu.utilization_percent)
-            .map(|value| format!("{value:.1}%"))
-            .unwrap_or_else(|| "Unavailable".to_owned());
-        let gpu_detail = match gpu {
-            Some(gpu) => match (gpu.dedicated_used_bytes, gpu.dedicated_total_bytes) {
-                (Some(used), Some(total)) => format!(
-                    "{} - {} / {} dedicated",
-                    gpu.name,
-                    format_bytes(Some(used)),
-                    format_bytes(Some(total))
-                ),
-                _ => format!("{} - dedicated memory unavailable", gpu.name),
-            },
-            None => "GPU utilization and memory unavailable".to_owned(),
-        };
+        let gpu_entries = self.gpu_entries();
         let network_entries = self.network_entries();
         let disk_entries = self.disk_entries();
 
         div()
+            .id("dashboard-scroll")
             .size_full()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_5()
@@ -255,7 +262,7 @@ impl Render for Dashboard {
                     .flex()
                     .flex_row()
                     .gap_4()
-                    .child(self.metric_card("GPU", gpu_usage, gpu_detail, ACCENT))
+                    .child(self.list_panel("GPUS", gpu_entries, "No GPU readings available"))
                     .child(self.list_panel(
                         "NETWORK",
                         network_entries,

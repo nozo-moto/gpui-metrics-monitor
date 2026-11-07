@@ -111,7 +111,7 @@ impl SystemCollector {
         };
 
         // Refresh the interface list and remove disappeared interfaces.
-        networks.refresh(false);
+        networks.refresh(true);
 
         let mut current = HashMap::new();
         let mut snapshots = Vec::with_capacity(networks.len());
@@ -150,7 +150,7 @@ impl SystemCollector {
         };
 
         // Re-enumerate devices so new disks are seen and removed disks are dropped.
-        disks.refresh(false);
+        disks.refresh(true);
 
         let mut current = HashMap::new();
         let mut snapshots = Vec::with_capacity(disks.len());

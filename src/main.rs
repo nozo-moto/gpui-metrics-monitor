@@ -2,7 +2,8 @@ mod metrics;
 mod ui;
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
+    thread,
     time::Duration,
 };
 
@@ -18,10 +19,21 @@ struct Collectors {
 fn main() {
     Application::new().run(|cx: &mut App| {
         let dashboard = cx.new(|_| Dashboard::default());
-        let collectors = Arc::new(Mutex::new(Collectors {
-            system: SystemCollector::new(),
-            gpu: GpuCollector::new(),
-        }));
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut collectors = Collectors {
+                system: SystemCollector::new(),
+                gpu: GpuCollector::new(),
+            };
+            loop {
+                let readings = (collectors.system.sample(), collectors.gpu.sample());
+                if sender.send(readings).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let receiver = Arc::new(Mutex::new(receiver));
 
         cx.open_window(
             WindowOptions {
@@ -35,14 +47,14 @@ fn main() {
 
         cx.spawn(async move |cx| {
             loop {
-                let collectors = collectors.clone();
-                let (system, gpus) = cx
+                let receiver = receiver.clone();
+                let Ok((system, gpus)) = cx
                     .background_executor()
-                    .spawn(async move {
-                        let mut collectors = collectors.lock().expect("collector lock poisoned");
-                        (collectors.system.sample(), collectors.gpu.sample())
-                    })
-                    .await;
+                    .spawn(async move { receiver.lock().expect("receiver lock poisoned").recv() })
+                    .await
+                else {
+                    break;
+                };
 
                 if cx
                     .update_entity(&dashboard, |view, cx| {
@@ -53,8 +65,6 @@ fn main() {
                 {
                     break;
                 }
-
-                cx.background_executor().timer(Duration::from_secs(1)).await;
             }
         })
         .detach();
