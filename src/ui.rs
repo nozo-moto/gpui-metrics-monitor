@@ -191,15 +191,23 @@ impl Dashboard {
                             .child(current_text),
                     ),
             )
-            .child(chart)
             .child(
                 div()
                     .flex()
-                    .justify_between()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(labels.zero)
-                    .child(labels.maximum),
+                    .gap_2()
+                    .child(div().flex_1().h(px(GRAPH_HEIGHT)).child(chart))
+                    .child(
+                        div()
+                            .w(px(80.))
+                            .h(px(GRAPH_HEIGHT))
+                            .flex()
+                            .flex_col()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(labels.maximum)
+                            .child(labels.zero),
+                    ),
             )
     }
 
@@ -214,7 +222,7 @@ impl Dashboard {
         div()
             .flex_1()
             .min_w(px(260.))
-            .h(px(188.))
+            .h(px(220.))
             .flex()
             .flex_col()
             .justify_between()

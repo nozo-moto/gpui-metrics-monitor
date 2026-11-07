@@ -12,6 +12,8 @@ cargo run
 
 The dashboard refreshes once per second and keeps 60 seconds of in-memory history for CPU, memory, GPU utilization, aggregate network throughput, and aggregate disk throughput. Its collector runs on a separate thread from the GPUI event loop. A reading is shown as unavailable when Windows does not supply a reliable value. Rate counters need two samples, so a few readings are unavailable during the first second.
 
+History is drawn as fixed-width line graphs. CPU and GPU use a 0–100% vertical range; memory uses 0 to installed RAM. Network and disk throughput use fixed **display ranges** of 0–10 MiB/s and 0–100 MiB/s respectively. These ranges are not hardware capacity estimates. Readings above them are clipped on the plot and flagged as over range. Missing readings leave gaps in the line.
+
 ## Data sources
 
 - CPU, memory, network interfaces, and disks: `sysinfo`.
